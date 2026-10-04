@@ -1,86 +1,132 @@
-# pyramid-tiler
+# bplustree — 基于固定大小 page 的本地 B+ Tree 索引
 
-纯本地的图像金字塔（image pyramid）与切片（tile）生成工具。所有输入图片、
-缩放层、tile、manifest 和缓存只存在于本地文件或内存中——不依赖地图服务器、
-CDN、云存储或任何外部服务，运行时无任何网络访问。
+纯 Python 实现，所有 page、元数据与索引节点只持久化在**本地文件**或**内存**中，
+不依赖 SQLite、RocksDB、数据库服务器或任何外部服务。
 
-## 安装与依赖
+## 功能
 
-- Python 3.10+
-- 依赖：`Pillow`、`numpy`（测试需要 `pytest`）
+- 支持 int64 或固定长度 bytes 的 key，固定长度 value
+- `insert` / `search` / `update` / `delete`，叶子节点按 key 严格有序
+- page 满时 split，separator 向父节点传播；根分裂时创建新根
+- 删除导致低于最小占用率时先 redistribution（向兄弟借），否则 merge；根可收缩
+- 叶子节点双向链表，支持闭/开区间范围扫描，结果严格有序、无重复遗漏
+- page 通过 page id 写入本地文件，重新打开后树结构与查询结果一致
+- 每页 CRC32 校验，损坏即报 `CorruptionError`
+- `verify()` 完整性检查：排序、父子 separator 约束、占用率、叶子链、条目计数
+- 重复 key 策略：key 唯一，`insert` 重复 key 抛 `DuplicateKeyError`，
+  修改已有 key 用 `update`
 
-```bash
-pip install pillow numpy pytest
+## Page 格式
+
+文件由固定大小（默认 4096 字节，可配置）的 page 组成，每页最后 4 字节为
+前 `page_size - 4` 字节的 CRC32 校验和。
+
+```
+page 0        : 元数据页（magic、版本、page 大小、根 page id、空闲页链表头、
+                总页数、条目数、key 类型/长度、value 长度）
+page 1..N-1   : 内部节点页 / 叶子节点页 / 空闲页（空闲页前 8 字节存下一空闲页 id）
 ```
 
-## 使用
+叶子节点页：
 
-```bash
-# 构建（或增量重建）金字塔
-python -m pyramid_tiler build input.jpg -o out/ \
-    --tile-size 256 --resample bilinear --min-size 256
-
-# 校验输出目录中所有 tile 与 manifest 的哈希是否一致
-python -m pyramid_tiler verify out/
+```
+B  node type = 1
+H  key 数量
+Q  next 叶子 page id（0 表示无）
+Q  prev 叶子 page id
+N × (key bytes, value bytes)      # 按 key 升序
 ```
 
-支持读取常见 PNG / JPEG（含灰度、调色板、带 alpha 的 PNG，统一规范化为
-RGB 或 RGBA）。所有输出 tile 均为无损 PNG，保证字节级稳定。
+内部节点页：
 
-## 层级算法
-
-- 第 0 级为原图（全分辨率）。
-- 每一级由上一级**精确缩小 2 倍**得到，宽高采用向上取整除法
-  `(n + 1) // 2`，因此奇数尺寸不会丢失任何边缘像素。
-- 当某一级满足 `max(width, height) <= min_size` 时停止，该级为最后一级。
-- 缩放方式 `--resample`：
-  - `nearest`：像素中心映射后取最近源像素，输出必是源图像素的子集；
-  - `bilinear`：像素中心映射（align_corners=False）的双线性插值，
-    先沿 x 后沿 y，float64 累加、单次取整。
-- 两种方法均直接在 numpy 上实现，不依赖第三方重采样内部行为，
-  **相同输入在任何机器上得到逐字节相同的结果**。
-
-## 坐标与切片规则
-
-- 每级按固定 `tile_size`（默认 256）切成网格，原点在**左上角**。
-- tile `(z, x, y)` 覆盖第 `z` 级的像素区域
-  `[x*ts, (x+1)*ts) × [y*ts, (y+1)*ts)`，文件存为 `tiles/{z}/{x}_{y}.png`。
-- **边缘规则（padding）**：右/下边缘不足一个完整 tile 时，用零值像素
-  补齐到完整 `tile_size × tile_size`（RGB 为黑色，RGBA 为透明）。
-  因此磁盘上每个 tile 尺寸完全一致；tile 内有效像素范围由 manifest 中的
-  `content_width` / `content_height` 记录，消费者据此裁剪即可。
-
-## Manifest
-
-`out/manifest.json` 是增量重建的唯一事实来源，内容包括：
-
-- `source`：原图文件名、宽高、SHA-256；
-- `config`：`tile_size` / `resample` / `min_size`；
-- `levels[]`：每级的 `z`、宽高、网格行列数，以及每个 tile 的
-  `x`、`y`、文件路径、存储尺寸、有效内容尺寸和文件 SHA-256。
-
-manifest 使用固定键序序列化，相同输入得到逐字节相同的 manifest。
-
-## 增量重建与原子写
-
-- 重建时若 manifest 中的源图哈希与配置均匹配，则逐 tile 校验磁盘文件的
-  SHA-256：**存在且哈希一致的 tile 直接跳过**；损坏、被截断或缺失的
-  tile 只重新生成受影响的部分；源图或配置变化则整体重建。
-- 所有文件（tile 与 manifest）都通过「同目录临时文件 + fsync +
-  `os.replace`」原子写入，manifest 永远最后发布。生成中断只会留下
-  不会被 manifest 引用的 `*.tmp` 临时文件，绝不会出现被 manifest
-  误认为有效的半文件；重新运行即可从混乱状态恢复到完整一致。
-
-## 测试
-
-全部测试在终端运行并输出校验结果，不打开任何图片窗口；测试图像由代码
-现场生成（确定性的渐变+棋盘合成图，无随机性）：
-
-```bash
-python -m pytest tests/ -v
+```
+B  node type = 0
+H  key 数量 k
+Q  child[0] page id
+k × (key bytes, Q child page id)  # 共 k+1 个子指针
 ```
 
-覆盖场景：奇数尺寸层级推算、边缘 tile 的 padding 与内容尺寸、
-nearest/bilinear 两种缩放及其确定性、PNG/JPEG/alpha 输入、manifest
-内容与哈希校验、增量跳过、tile 损坏/缺失/截断后的定点重生成、
-源图变化触发全量重建、中途崩溃不留半文件、残留临时文件不被误用。
+内部节点中 `key[i]` 是 separator：`child[i]` 子树的 key 全部 `< key[i]`，
+`child[i+1]` 子树的 key 全部 `>= key[i]`。
+
+节点容量由 page 大小与 key/value 长度推导，例如 4KB 页、8 字节 key/value 时
+叶子容量 254 条、内部节点容量 254 个 key。最小占用率为容量的一半（向上取整），
+根节点除外。
+
+## Split / Merge 算法
+
+**插入 split（自底向上）**
+
+1. 递归定位到目标叶子并按键序插入；若超过容量，从中间分裂为左右两个叶子，
+   右叶子的最小 key 作为 separator 上传，同时维护叶子间 next/prev 链表。
+2. 父内部节点插入 separator 与新子指针；若同样溢出，则将中间 key 上传，
+   左右各分一半 key 与子指针（中间 key 不保留在下层）。
+3. 若根节点分裂，创建只含一个 separator 的新根，树高加一。
+
+**删除 merge / redistribution（自底向上）**
+
+1. 从叶子删除 key 后，若节点 key 数低于最小占用率：
+   - 优先向 key 数大于最小值的左（或右）兄弟**借**一个 key
+     （内部节点借 key 时经过父节点 separator 旋转）；
+   - 兄弟也不够借时与兄弟**合并**，父节点中对应 separator 下移/删除，
+     被清空的 page 挂入空闲链表复用；叶子合并时修复链表指针。
+2. 若内部根节点只剩一个子节点，子节点提升为新根，树高减一；
+   根叶子删空则树变为空树。
+
+## 复杂度
+
+设树高为 h（h = O(log n)，n 为条目数，扇出由 page 大小决定，通常数百）：
+
+| 操作          | 复杂度            |
+| ------------- | ----------------- |
+| search        | O(log n)          |
+| insert        | O(log n)          |
+| update        | O(log n)          |
+| delete        | O(log n)          |
+| range_scan    | O(log n + k)，k 为结果条数 |
+| verify        | O(n)              |
+
+## 使用示例
+
+```python
+from bplustree import BPlusTree
+
+with BPlusTree.open("idx.db", page_size=4096, key_kind="int",
+                    value_size=8) as t:
+    t.insert(10, b"\x01" * 8)
+    t.update(10, (123).to_bytes(8, "little"))
+    print(t.search(10))
+    t.delete(10)
+    for k, v in t.range_scan(0, 100, hi_inclusive=False):
+        ...
+    t.verify()
+
+# 纯内存模式
+t = BPlusTree.in_memory(page_size=512, key_kind="bytes", key_size=16)
+```
+
+重新打开已有文件时，page 大小、key/value 配置自动从元数据页恢复。
+
+## 运行测试
+
+```bash
+cd <项目根目录>
+python3 -m pytest tests/ -q
+```
+
+测试覆盖：连续插入、随机插入、多层 split、删除合并/借用与根收缩、
+闭/开区间范围扫描、重复 key 策略、文件重载一致性、页损坏与元数据损坏检测、
+叶子链破坏后的完整性检查、固定长度 bytes key、纯内存模式。
+
+## 目录结构
+
+```
+bplustree/
+  __init__.py   # 包导出
+  errors.py     # 异常类型
+  pager.py      # 固定 page 读写、CRC 校验、空闲页链表、元数据页
+  nodes.py      # 叶子/内部节点的序列化与反序列化
+  tree.py       # B+ Tree：insert/search/update/delete/range_scan/verify
+tests/
+  test_bplustree.py
+```
